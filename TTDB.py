@@ -7,6 +7,15 @@ import select
 import socket
 import sys
 
+class ReadOnlyException(Exception):
+  pass
+
+class ConflictingLockException(Exception):
+  pass
+
+class NoTransactionException(Exception):
+  pass
+
 class TTDBTable(object):
   """A table and corresponding index for the TT database.
 
@@ -105,16 +114,16 @@ class TTDBTable(object):
       table: The dictionary with which to update self.table
       index: The dictionary with which to update self.index
 
-    Returns:
-      A boolean indicating whether the update operation succeeded
+    Raises:
+      ConflictingLockException: An exception raised when trying to write to a variable with a later read stamp
     """
     for k,v in table.items():
       if k in self.table and self.table[k][1] > v[1]:
-        return False
+        raise ConflictingLockException
 
     for k,v in index.items():
       if k in self.index and self.index[k][1] > v[1]:
-        return False
+        return ConflictingLockException
 
     for k,v in table.items():
       for value in v[0]:
@@ -123,8 +132,6 @@ class TTDBTable(object):
     for k,v in index.items():
       for value in v[0]:
         self.__insert(self.index, k, value)
-
-    return True
 
   def read_value(self, key, time):
     """Read item from database as it existed at the given time.
@@ -188,15 +195,15 @@ class TTDBTable(object):
       self.__insert(self.index, value, (old_index + 1, time))
 
   def commit(self):
-    """Commit the database to the parent database
-
-    Returns:
-      A boolean indicating whether the commit succeeded.
+    """Commit the database to the parent database.
+    
+    Raises:
+      NoTransactionException: An exception raised if there is no transaction to commit.
     """
     if self.parent is not None:
       return self.parent.__update(self.table, self.index)
     else:
-      return False
+      raise NoTransactionException
 
   def purge_entries(self, time):
     """Purge entries from the database older than the indicated time
@@ -214,10 +221,10 @@ class TTDBTable(object):
         del self.table[key]
       else:
         values = self.table[key][0]
-	out_values = []
-	for value in values:
-          if value[1] > time:
-            out_values.append(value)
+	cutoff = time
+	if values[0][1] <= time:
+          cutoff = max([value[1] for value in values if value[1] <= time])
+	out_values = [value for value in values if value[1] >= cutoff]
 	if len(out_values) > 0:
 	  self.table[key][0] = out_values
 	else:
@@ -230,10 +237,10 @@ class TTDBTable(object):
         del self.index[key]
       elif len(self.index[key][0]) > 1:
         values = self.index[key][0]
-	out_values = []
-	for value in values:
-          if value[1] > time:
-            out_values.append(value)
+	cutoff = time
+	if values[0][1] <= time:
+          cutoff = max([value[1] for value in values if value[1] <= time])
+	out_values = [value for value in values if value[1] >= cutoff]
 	if len(out_values) > 0:
 	  self.index[key][0] = out_values
 	else:
@@ -265,6 +272,9 @@ class TTDB(object):
     Args:
       sock_addr: Location of Unix socket to use
       purge_period: Minimum period at which to purge database of outdated items
+
+    Raises:
+      OSError: Error raised if the socket already exists but cannot be removed
     """
     try:
       os.unlink(sock_addr)
@@ -299,19 +309,38 @@ class TTDB(object):
                 continue
               datum = datum.split()
               if datum[0] == 'SET' and len(datum) == 3:
-                self.set(datum[1], datum[2], s)
+		try:
+                  self.set(datum[1], datum[2], s)
+		except ReadOnlyException:
+		  s.sendall('Cannot SET in read-only transaction')
+		except ConflictingLockException:
+                  s.sendall('Conflicting lock. Aborting SET.')
               elif datum[0] == 'GET' and len(datum) == 2:
                 self.get(datum[1], s)
               elif datum[0] == 'UNSET' and len(datum) == 2:
-                self.unset(datum[1], s)
+		try:
+                  self.unset(datum[1], s)
+		except ReadOnlyException:
+		  s.sendall('Cannot UNSET in read-only transaction')
+		except ConflictingLockException:
+                  s.sendall('Conflicting lock. Aborting UNSET.')
               elif datum[0] == 'NUMEQUALTO' and len(datum) == 2:
                 self.numequalto(datum[1], s)
               elif datum[0] == 'BEGIN' and len(datum) == 1:
-                self.begin(s)
+                self.begin(s, 'RW')
+              elif datum[0] == 'BEGIN' and len(datum) == 2:
+                self.begin(s, datum[1])
               elif datum[0] == 'ROLLBACK' and len(datum) == 1:
                 self.rollback(s)
               elif datum[0] == 'COMMIT' and len(datum) == 1:
-                self.commit(s)
+		try:
+                  self.commit(s)
+                  del self.transactions[s]
+		except ConflictingLockException:
+                  connection.sendall('Conflicting lock. Rolling back.')
+                  del self.transactions[s]
+                except NoTransactionException:
+                  connection.sendall('No transaction to commit.')
               elif datum[0] == 'RESET' and len(datum) == 1:
                 self.ttable = TTDBTable()
                 self.transactions = {}
@@ -321,6 +350,7 @@ class TTDB(object):
                   self.transactions[s].debug()
                 else:
                   self.ttable.debug()
+		s.sendall('success')
           else:
             s.close()
             self.connections.remove(s)
@@ -329,18 +359,19 @@ class TTDB(object):
             print >>sys.stderr, "Connections: %s" % ",".join([str(i.fileno()) for i in self.connections])
       self.ttable.purge_entries(min([s.timestamp for s in self.transactions.values()] + [datetime.datetime.now()]))
 
-  def begin(self, connection):
+  def begin(self, connection, transaction_type):
     """Open a new transaction and associate it with the connection.
 
     If the connection already has a transaction, this will nest a new one in it.
 
     Args:
       connection: The socket connection calling the 'begin'
+      transaction_type: A string containing the transaction type: RW (read-write) or RO (read-only)
     """
     if connection in self.transactions:
       self.transactions[connection].begin()
     else:
-      self.transactions[connection] = TTDBTransaction(self.ttable)
+      self.transactions[connection] = TTDBTransaction(self.ttable, transaction_type)
     connection.sendall('success')
 
   def commit(self, connection):
@@ -353,21 +384,19 @@ class TTDB(object):
 
     Args:
       connection: The socket connection calling the 'commit'
+
+    Raises:
+      ConflictingLockException: An exception raised when trying to commit while an earlier transaction has priority
+      NoTransactionException: An exception raised when there is no transaction to commit
     """
-    if connection in self.transactions and self.transactions[connection].timestamp > min([X.timestamp for X in self.transactions.values()]):
-      del self.transactions[connection]
-      print >>sys.stderr, 'sending abort'
-      connection.sendall('Conflicting lock. Aborting transaction.')
-      return
-    if connection in self.transactions:
-      success = self.transactions[connection].commit()
-      del self.transactions[connection]
-      if success:
-        connection.sendall('success')
-      else:
-        connection.sendall('Commit failed. Rolling back.')
+    if connection not in self.transactions:
+      raise NoTransactionException
+
+    if self.transactions[connection].writeable() and self.transactions[connection].timestamp > min([X.timestamp for X in self.transactions.values() if X.writeable()]):
+      raise ConflictingLockException
     else:
-        connection.sendall('No transaction to commit.')
+      self.transactions[connection].commit()
+      connection.sendall('success')
 
   def rollback(self, connection):
     """Rollback the open transaction, collapsing nested transactions if they exist.
@@ -398,12 +427,14 @@ class TTDB(object):
       variable: A string containing the variable to set
       value: The value to set variable to
       connection: The socket connection calling the 'set'
+
+    Raises:
+      ConflictingLockException: An exception raised when trying to write while a transaction has write priority
     """
     if connection in self.transactions:
       self.transactions[connection].set(variable, value)
-    elif len(self.transactions) > 0:
-      print >>sys.stderr, 'sending abort'
-      connection.sendall('Conflicting lock. Aborting write.')
+    elif len([1 for transaction in self.transactions.values() if transaction.writeable()]) > 0:
+      raise ConflictingLockException
     else:
       self.ttable.write_value(variable, value, datetime.datetime.now())
     connection.sendall('success')
@@ -444,12 +475,14 @@ class TTDB(object):
     Args:
       variable: A string containing the variable to unset
       connection: The socket connection calling the 'unset'
+
+    Raises:
+      ConflictingLockException: An exception raised when trying to write while a transaction has write priority
     """
     if connection in self.transactions:
       self.transactions[connection].unset(variable)
-    elif len(self.transactions) > 0:
-      print >>sys.stderr, 'sending abort'
-      connection.sendall('Aborting write.')
+    elif len([1 for transaction in self.transactions.values() if transaction.writeable()]) > 0:
+      raise ConflictingLockException
     else:
       self.ttable.write_value(variable, None, datetime.datetime.now())
     connection.sendall('success')
@@ -480,13 +513,15 @@ class TTDBTransaction(object):
   Attributes:
     ttable: TTDBTable object with the transaction-level database
     timestamp: datetime stamp indicating time at which the transaction was created and at which it acts
+    type: A string containing the transaction type: RW (read-write) or RO (read-only)
     subtransaction: TTDBTransaction object indicating the next level of transaction nesting
   """
-  def __init__(self, parent, timestamp=None):
+  def __init__(self, parent, transaction_type, timestamp=None):
     """Init TTDBTransaction with given parent, a timestamp, and no subtransaction
 
     Args:
       parent: TTDBTable that acts as a parent to this transaction's table
+      transaction_type: A string containing the transaction type: RW (read-write) or RO (read-only)
       timestamp: Optional datetime stamp to use for read and write stamps from this transaction.  One should always be given when nesting and one will be created when not nesting.
     """
     if timestamp is None:
@@ -494,6 +529,7 @@ class TTDBTransaction(object):
     else:
       self.timestamp = timestamp
     self.subtransaction = None
+    self.type = transaction_type
     self.ttable = TTDBTable(parent)
 
   def begin(self):
@@ -505,7 +541,7 @@ class TTDBTransaction(object):
     if self.subtransaction is not None:
       self.subtransaction.begin()
     else:
-      self.subtransaction = TTDBTransaction(self.ttable, self.timestamp)
+      self.subtransaction = TTDBTransaction(self.ttable, self.type, self.timestamp)
 
   def rollback(self):
     """Rollback the transaction, collapsing nested transactions if they exist."""
@@ -519,18 +555,11 @@ class TTDBTransaction(object):
     """Commit the transaction, collapsing nested transactions if they exist.
 
     The commit may fail if there is a conflicting read timestamp.
-    
-    Returns:
-      A boolean indicating whether the commit succeeded.
     """
-    success = True
     if self.subtransaction is not None:
-      success = self.subtransaction.commit()
-
-    if success:
-      return self.ttable.commit()
-    else:
-      return False
+      self.subtransaction.commit()
+      
+    self.ttable.commit()
 
   def set(self, variable, value):
     """Set variable to given the value
@@ -541,7 +570,12 @@ class TTDBTransaction(object):
     Args:
       variable: A string containing the variable to set
       value: The value to set variable to
+
+    Raises:
+      ReadOnlyException: An exception raised when trying to write with a read-only transaction
     """
+    if not self.writeable():
+      raise ReadOnlyException
     if self.subtransaction is not None:
       self.subtransaction.set(variable, value)
     else:
@@ -572,7 +606,12 @@ class TTDBTransaction(object):
 
     Args:
       variable: A string containing the variable to unset
+
+    Raises:
+      ReadOnlyException: An exception raised when trying to write with a read-only transaction
     """
+    if not self.writeable():
+      raise ReadOnlyException()
     if self.subtransaction is not None:
       self.subtransaction.unset(variable)
     else:
@@ -595,11 +634,15 @@ class TTDBTransaction(object):
     else:
       return self.ttable.read_index(value, self.timestamp)
 
+  def writeable(self):
+    return self.type == 'RW'
+
   def debug(self):
     """Print table and index dictionaries for debugging purposes."""
     if self.subtransaction is not None:
       self.subtransaction.debug()
 
+    print self.timestamp
     self.ttable.debug()
 
 

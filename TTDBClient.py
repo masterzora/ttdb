@@ -21,6 +21,7 @@ def main():
     if len(line) == 0:
       continue
     elif line[0].upper() == 'END' and len(line) == 1:
+      sock.close()
       break
     elif line[0].upper() == 'SET' and len(line) == 3:
       do_set(line[1], line[2], sock)
@@ -31,7 +32,9 @@ def main():
     elif line[0].upper() == 'NUMEQUALTO' and len(line) == 2:
       do_numequalto(line[1], sock)
     elif line[0].upper() == 'BEGIN' and len(line) == 1:
-      do_begin(sock)
+      do_begin(sock, 'RW')
+    elif line[0].upper() == 'BEGIN' and len(line) == 2 and line[1].upper() in ['RW', 'RO']:
+      do_begin(sock, line[1])
     elif line[0].upper() == 'ROLLBACK' and len(line) == 1:
       do_rollback(sock)
     elif line[0].upper() == 'COMMIT' and len(line) == 1:
@@ -75,8 +78,7 @@ def do_unset(variable, sock):
   """
   sock.sendall(" ".join(('UNSET', variable, '|')))
   msg = sock.recv(64)
-  if msg != 'success':
-    print msg
+  if msg != 'success': print msg
 
 def do_numequalto(value, sock):
   """Send NUMEQUALTO command to server.
@@ -88,13 +90,16 @@ def do_numequalto(value, sock):
   sock.sendall(" ".join(('NUMEQUALTO', value, '|')))
   print sock.recv(64)
 
-def do_begin(sock):
+def do_begin(sock, transaction_type):
   """Send BEGIN command to server.
 
   Args:
     sock: socket connection where to send command
   """
-  sock.sendall('BEGIN |')
+  if transaction_type.upper() == 'RW':
+    sock.sendall('BEGIN RW |')
+  elif transaction_type.upper() == 'RO':
+    sock.sendall('BEGIN RO |')
   msg = sock.recv(64)
   if msg != 'success':
     print msg
